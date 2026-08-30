@@ -8,12 +8,143 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     ffi::{OsStr, OsString},
-    fs, io,
+    fs,
+    io::{self, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     time::SystemTime,
 };
 
+use serde_json::Value;
+
 const MODEL_PREFIX: &str = "models--";
+const MAX_JSON_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MODEL_CARD_BYTES: u64 = 512 * 1024;
+const MAX_WEIGHT_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalModelMetadata {
+    pub identity: ModelIdentity,
+    pub parameters: Option<ParameterCount>,
+    pub precision: PrecisionInfo,
+    pub maximum_context_length: Option<u64>,
+    pub pipeline_task: Option<String>,
+    pub license: Option<String>,
+    pub weight_formats: Vec<WeightFormat>,
+    pub selected_revision: Option<SelectedRevision>,
+    pub completeness: CacheCompleteness,
+    pub warnings: Vec<CacheWarning>,
+}
+
+impl Default for LocalModelMetadata {
+    fn default() -> Self {
+        Self {
+            identity: ModelIdentity::default(),
+            parameters: None,
+            precision: PrecisionInfo::default(),
+            maximum_context_length: None,
+            pipeline_task: None,
+            license: None,
+            weight_formats: Vec::new(),
+            selected_revision: None,
+            completeness: CacheCompleteness::Unknown,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModelIdentity {
+    pub architectures: Vec<String>,
+    pub model_type: Option<String>,
+    pub family: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterCount {
+    pub value: u64,
+    pub confidence: ParameterCountConfidence,
+    pub source: MetadataSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterCountConfidence {
+    Exact,
+    Reported,
+    Estimated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MetadataSource {
+    SafeTensorsHeader,
+    SafeTensorsMetadata,
+    ConfigField(String),
+    ModelCard,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrecisionInfo {
+    pub dtype: Option<ModelDtype>,
+    pub quantization: Option<QuantizationInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelDtype {
+    Float64,
+    Float32,
+    Float16,
+    BFloat16,
+    Float8,
+    Int8,
+    Int4,
+    Other(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuantizationInfo {
+    pub method: String,
+    pub bits: Option<u8>,
+    pub variant: Option<String>,
+    pub source: QuantizationSource,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantizationSource {
+    Config,
+    FileName,
+    GgufHeader,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedRevision {
+    pub commit: String,
+    pub references: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheCompleteness {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CacheWarning {
+    MissingReferencedFile(PathBuf),
+    IncompleteArtifact(PathBuf),
+    LockArtifact(PathBuf),
+    MalformedMetadata(PathBuf),
+    OversizedMetadata(PathBuf),
+    IncompleteShardSet {
+        group: String,
+        expected: usize,
+        found: usize,
+    },
+    MultipleSnapshots(usize),
+    DuplicateRevisionReferences {
+        commit: String,
+        references: Vec<String>,
+    },
+}
 
 /// Information about one locally cached Hugging Face model repository.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +174,8 @@ pub struct ModelInfo {
     pub revision_count: usize,
     /// Most recent filesystem modification time found in the model cache.
     pub last_modified: Option<SystemTime>,
+    /// Best-effort runtime/UI metadata derived exclusively from local files.
+    pub metadata: LocalModelMetadata,
 }
 
 /// Return the Hugging Face Hub cache root selected from the environment.
@@ -80,6 +213,7 @@ pub fn scan_models(cache_root: impl AsRef<Path>) -> io::Result<Vec<ModelInfo>> {
         let snapshot_count = count_immediate_directories(&path.join("snapshots"));
         let revision_count = count_regular_files(&path.join("refs"));
         let estimated_model_weight_bytes = estimate_model_weight_bytes(&path);
+        let metadata = inspect_local_metadata(&path, snapshot_count);
         models.push(ModelInfo {
             id: format!("{organization}/{name}"),
             organization,
@@ -90,6 +224,7 @@ pub fn scan_models(cache_root: impl AsRef<Path>) -> io::Result<Vec<ModelInfo>> {
             snapshot_count,
             revision_count,
             last_modified: stats.last_modified,
+            metadata,
         });
     }
 
@@ -371,11 +506,14 @@ fn count_regular_files(root: &Path) -> usize {
     count
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum WeightFormat {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WeightFormat {
     SafeTensors,
-    Pytorch,
+    PyTorch,
     Gguf,
+    Onnx,
+    TensorFlow,
+    Flax,
 }
 
 type WeightArtifact = (WeightFormat, String, Option<(usize, usize)>);
@@ -559,11 +697,11 @@ fn weight_artifact(file_name: &str) -> Option<WeightArtifact> {
     } else if let Some(stem) = lower.strip_suffix(".gguf") {
         (stem, WeightFormat::Gguf)
     } else if let Some(stem) = lower.strip_suffix(".bin") {
-        (stem, WeightFormat::Pytorch)
+        (stem, WeightFormat::PyTorch)
     } else if let Some(stem) = lower.strip_suffix(".pth") {
-        (stem, WeightFormat::Pytorch)
+        (stem, WeightFormat::PyTorch)
     } else {
-        (lower.strip_suffix(".pt")?, WeightFormat::Pytorch)
+        (lower.strip_suffix(".pt")?, WeightFormat::PyTorch)
     };
     let (group, shard) = shard_group(stem);
     Some((format, group.to_owned(), shard))
