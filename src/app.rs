@@ -1,6 +1,13 @@
 use std::{
     cmp::Ordering,
+    collections::HashMap,
     path::PathBuf,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        mpsc::{self, Receiver},
+    },
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -9,13 +16,100 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 
 use crate::{
     Tui,
-    cache::{self, ModelInfo},
+    cache::{self, ContextVramEstimate, LocalModelMetadata, ModelInfo},
     gpu::{self, GpuAllocationEstimate, GpuCountEstimate, GpuDetection},
+    hub::{self, HubClient, ModelMetadata},
     ui,
 };
 
 const EVENT_WAIT: Duration = Duration::from_millis(250);
 pub(crate) const VRAM_OVERHEAD_PERCENT: u32 = 20;
+const DEFAULT_CONTEXT_TOKENS: u64 = 2_048;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HubModelState {
+    Loading,
+    Ready(ModelMetadata),
+    Error(String),
+}
+
+struct HubJob {
+    generation: u64,
+    model_ids: Vec<String>,
+}
+
+struct HubResult {
+    generation: u64,
+    model_id: String,
+    result: Result<ModelMetadata, hub::HubError>,
+}
+
+struct HubWorker {
+    pending: Arc<(Mutex<Option<HubJob>>, Condvar)>,
+    results: Receiver<HubResult>,
+    latest_generation: Arc<AtomicU64>,
+}
+
+impl HubWorker {
+    fn start() -> std::io::Result<Self> {
+        let pending = Arc::new((Mutex::new(None::<HubJob>), Condvar::new()));
+        let worker_pending = Arc::clone(&pending);
+        let (results_tx, results_rx) = mpsc::sync_channel(64);
+        let latest_generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&latest_generation);
+        thread::Builder::new()
+            .name("hugtop-hub".into())
+            .spawn(move || {
+                let client = HubClient::new();
+                loop {
+                    let job = {
+                        let (lock, ready) = &*worker_pending;
+                        let mut pending = lock.lock().unwrap_or_else(|error| error.into_inner());
+                        while pending.is_none() {
+                            pending = ready
+                                .wait(pending)
+                                .unwrap_or_else(|error| error.into_inner());
+                        }
+                        pending.take().expect("pending Hub job checked")
+                    };
+                    if job.generation != worker_generation.load(AtomicOrdering::Acquire) {
+                        continue;
+                    }
+                    for model_id in job.model_ids {
+                        if job.generation != worker_generation.load(AtomicOrdering::Acquire) {
+                            break;
+                        }
+                        let result = client.fetch_model(&model_id);
+                        if job.generation != worker_generation.load(AtomicOrdering::Acquire) {
+                            break;
+                        }
+                        if results_tx
+                            .send(HubResult {
+                                generation: job.generation,
+                                model_id,
+                                result,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            pending,
+            results: results_rx,
+            latest_generation,
+        })
+    }
+
+    fn replace_pending(&self, job: HubJob) {
+        let (lock, ready) = &*self.pending;
+        let mut pending = lock.lock().unwrap_or_else(|error| error.into_inner());
+        *pending = Some(job);
+        ready.notify_one();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SortMode {
@@ -49,7 +143,6 @@ impl SortMode {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct App {
     pub(crate) cache_root: PathBuf,
     pub(crate) models: Vec<ModelInfo>,
@@ -66,6 +159,13 @@ pub(crate) struct App {
     pub(crate) action_status: Option<ActionStatus>,
     pub(crate) pending_delete: Option<PendingDelete>,
     pub(crate) deleting: Option<PendingDelete>,
+    pub(crate) context_tokens: u64,
+    pub(crate) online: bool,
+    pub(crate) hub_generation: u64,
+    pub(crate) hub_states: HashMap<String, HubModelState>,
+    pub(crate) local_metadata: HashMap<String, LocalModelMetadata>,
+    hub_worker: Option<HubWorker>,
+    hub_worker_error: Option<String>,
     should_quit: bool,
 }
 
@@ -100,7 +200,27 @@ enum AppAction {
 }
 
 impl App {
+    #[cfg(test)]
     pub(crate) fn new(cache_root: PathBuf, gpu_detection: GpuDetection) -> Self {
+        Self::new_with_online(cache_root, gpu_detection, false)
+    }
+
+    pub(crate) fn new_with_online(
+        cache_root: PathBuf,
+        gpu_detection: GpuDetection,
+        online: bool,
+    ) -> Self {
+        let (hub_worker, hub_worker_error) = if online {
+            match HubWorker::start() {
+                Ok(worker) => (Some(worker), None),
+                Err(error) => (
+                    None,
+                    Some(format!("could not start Hub background worker: {error}")),
+                ),
+            }
+        } else {
+            (None, None)
+        };
         Self {
             cache_root,
             models: Vec::new(),
@@ -117,6 +237,13 @@ impl App {
             action_status: None,
             pending_delete: None,
             deleting: None,
+            context_tokens: DEFAULT_CONTEXT_TOKENS,
+            online,
+            hub_generation: 0,
+            hub_states: HashMap::new(),
+            local_metadata: HashMap::new(),
+            hub_worker,
+            hub_worker_error,
             should_quit: false,
         }
     }
@@ -139,17 +266,28 @@ impl App {
         })
     }
 
+    pub(crate) fn metadata_for(&self, model: &ModelInfo) -> Option<&LocalModelMetadata> {
+        self.local_metadata.get(&model.id)
+    }
+
+    pub(crate) fn context_estimate(&self, model: &ModelInfo) -> ContextVramEstimate {
+        model.context_vram_estimate(
+            &self.metadata_for(model).cloned().unwrap_or_default(),
+            self.context_tokens,
+            VRAM_OVERHEAD_PERCENT,
+        )
+    }
+
     pub(crate) fn estimated_vram_mib(&self, model: &ModelInfo) -> Option<u64> {
-        let bytes = model.estimated_model_weight_bytes?;
-        let mib = bytes.checked_add((1 << 20) - 1)? >> 20;
-        gpu::add_overhead_percent(mib, VRAM_OVERHEAD_PERCENT)
+        let bytes = self.context_estimate(model).allocation_input_bytes?;
+        bytes.checked_add((1 << 20) - 1).map(|value| value >> 20)
     }
 
     pub(crate) fn gpu_allocation_estimate(
         &self,
         model: &ModelInfo,
     ) -> Option<GpuAllocationEstimate> {
-        let required_bytes = self.estimated_vram_mib(model)?.checked_mul(1 << 20)?;
+        let required_bytes = self.context_estimate(model).allocation_input_bytes?;
         Some(self.gpu_detection.allocate(required_bytes))
     }
 
@@ -168,8 +306,14 @@ impl App {
         match cache::scan_models(&self.cache_root) {
             Ok(models) => {
                 self.models = models;
+                self.local_metadata = self
+                    .models
+                    .iter()
+                    .map(|model| (model.id.clone(), model.local_metadata()))
+                    .collect();
                 self.scan_error = None;
                 self.rebuild_visible(selected_id.as_deref());
+                self.restart_hub_enrichment();
             }
             Err(error) => {
                 self.scan_error = Some(format!(
@@ -179,6 +323,87 @@ impl App {
                 self.rebuild_visible(selected_id.as_deref());
             }
         }
+    }
+
+    fn restart_hub_enrichment(&mut self) {
+        self.hub_generation = self.hub_generation.wrapping_add(1);
+        self.hub_states.clear();
+        let Some(worker) = &self.hub_worker else {
+            if let Some(error) = &self.hub_worker_error {
+                for model in &self.models {
+                    self.hub_states
+                        .insert(model.id.clone(), HubModelState::Error(error.clone()));
+                }
+            }
+            return;
+        };
+        worker
+            .latest_generation
+            .store(self.hub_generation, AtomicOrdering::Release);
+        for model in &self.models {
+            self.hub_states
+                .insert(model.id.clone(), HubModelState::Loading);
+        }
+        worker.replace_pending(HubJob {
+            generation: self.hub_generation,
+            model_ids: self.models.iter().map(|model| model.id.clone()).collect(),
+        });
+    }
+
+    fn apply_hub_result(&mut self, result: HubResult) -> bool {
+        if result.generation != self.hub_generation
+            || !self.models.iter().any(|model| model.id == result.model_id)
+        {
+            return false;
+        }
+        let state = match result.result {
+            Ok(metadata) => HubModelState::Ready(metadata),
+            Err(error) => HubModelState::Error(error.to_string()),
+        };
+        self.hub_states.insert(result.model_id, state);
+        true
+    }
+
+    fn drain_hub_results(&mut self) -> bool {
+        let mut changed = false;
+        let mut results = Vec::new();
+        if let Some(worker) = &self.hub_worker {
+            while let Ok(result) = worker.results.try_recv() {
+                results.push(result);
+            }
+        }
+        for result in results {
+            changed |= self.apply_hub_result(result);
+        }
+        changed
+    }
+
+    pub(crate) fn hub_progress(&self) -> (usize, usize) {
+        let loading = self
+            .hub_states
+            .values()
+            .filter(|state| matches!(state, HubModelState::Loading))
+            .count();
+        (
+            self.hub_states.len().saturating_sub(loading),
+            self.hub_states.len(),
+        )
+    }
+
+    fn cycle_context(&mut self) {
+        let maximum = self
+            .selected_model()
+            .and_then(|model| self.metadata_for(model))
+            .and_then(|metadata| metadata.maximum_context_length);
+        let presets = cache::context_presets(maximum);
+        if presets.is_empty() {
+            return;
+        }
+        self.context_tokens = presets
+            .iter()
+            .copied()
+            .find(|value| *value > self.context_tokens)
+            .unwrap_or(presets[0]);
     }
 
     fn rebuild_visible(&mut self, preferred_id: Option<&str>) {
@@ -314,6 +539,10 @@ impl App {
                 self.action_status = None;
                 return Some(AppAction::Refresh);
             }
+            KeyCode::Char('c') => {
+                self.action_status = None;
+                self.cycle_context();
+            }
             KeyCode::Char('d') => {
                 let model = self.selected_model()?.clone();
                 self.action_status = None;
@@ -401,15 +630,16 @@ fn compare_modified(left: Option<SystemTime>, right: Option<SystemTime>) -> Orde
     }
 }
 
-pub(crate) fn run(terminal: &mut Tui, cache_dir: Option<PathBuf>) -> Result<()> {
+pub(crate) fn run(terminal: &mut Tui, cache_dir: Option<PathBuf>, online: bool) -> Result<()> {
     let cache_root = cache_dir
         .or_else(cache::discover_cache_root)
         .unwrap_or_else(|| PathBuf::from(".cache/huggingface/hub"));
-    let mut app = App::new(cache_root, gpu::detect_nvidia_gpus());
+    let mut app = App::new_with_online(cache_root, gpu::detect_nvidia_gpus(), online);
     app.refresh(false);
     let mut dirty = true;
 
     while !app.should_quit {
+        dirty |= app.drain_hub_results();
         if dirty {
             terminal.draw(|frame| ui::draw(frame, &app))?;
             dirty = false;
@@ -452,6 +682,10 @@ pub(crate) fn run(terminal: &mut Tui, cache_dir: Option<PathBuf>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{
+        CacheCompleteness, ModelDtype, ModelIdentity, PrecisionInfo, TransformerDimensions,
+        WeightFormat,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     fn model(id: &str, bytes: u64) -> ModelInfo {
@@ -478,6 +712,33 @@ mod tests {
         ];
         app.rebuild_visible(None);
         app
+    }
+
+    fn decoder_metadata(maximum_context_length: Option<u64>) -> LocalModelMetadata {
+        LocalModelMetadata {
+            identity: ModelIdentity {
+                architectures: vec!["LlamaForCausalLM".into()],
+                model_type: Some("llama".into()),
+                family: Some("Llama".into()),
+            },
+            precision: PrecisionInfo {
+                dtype: Some(ModelDtype::Float16),
+                quantization: None,
+            },
+            maximum_context_length,
+            pipeline_task: Some("text-generation".into()),
+            weight_formats: vec![WeightFormat::SafeTensors],
+            completeness: CacheCompleteness::Complete,
+            transformer: TransformerDimensions {
+                hidden_size: Some(4096),
+                num_hidden_layers: Some(32),
+                num_attention_heads: Some(32),
+                num_key_value_heads: Some(8),
+                head_dim: Some(128),
+                dtype_bytes: Some(2),
+            },
+            ..LocalModelMetadata::default()
+        }
     }
 
     fn press(character: char) -> KeyEvent {
@@ -556,6 +817,8 @@ mod tests {
     fn gpu_count_preserves_no_gpu_unknown_and_insufficient_states() {
         let mut app = app();
         let model = model("acme/large", 10 * 1024 * 1024);
+        app.local_metadata
+            .insert(model.id.clone(), decoder_metadata(None));
 
         assert!(matches!(
             app.gpu_count_estimate(&model),
@@ -585,7 +848,7 @@ mod tests {
         ));
 
         app.gpu_detection = GpuDetection::Detected(
-            gpu::parse_nvidia_smi_output("large, 16, 16")
+            gpu::parse_nvidia_smi_output("large, 512, 512")
                 .unwrap()
                 .unwrap(),
         );
@@ -593,6 +856,91 @@ mod tests {
             app.gpu_count_estimate(&model),
             GpuCountEstimate::Gpus(count) if count.get() == 1
         ));
+    }
+
+    #[test]
+    fn offline_is_default_and_never_starts_a_hub_worker() {
+        let app = App::new("cache".into(), GpuDetection::NoGpu);
+        assert!(!app.online);
+        assert!(app.hub_worker.is_none());
+        assert!(app.hub_worker_error.is_none());
+        assert!(app.hub_states.is_empty());
+    }
+
+    #[test]
+    fn stale_hub_results_are_rejected() {
+        let mut app = app();
+        app.hub_generation = 7;
+        app.hub_states
+            .insert("acme/large".into(), HubModelState::Loading);
+        let result = HubResult {
+            generation: 6,
+            model_id: "acme/large".into(),
+            result: Ok(ModelMetadata {
+                repo_id: "acme/large".into(),
+                latest_revision: Some("abcdef0123456789".into()),
+                last_modified: None,
+                pipeline_tag: None,
+                library: None,
+                tags: vec![],
+                license: None,
+                gated: hub::GatedStatus::No,
+                private: false,
+                disabled: false,
+                deprecated: false,
+            }),
+        };
+        assert!(!app.apply_hub_result(result));
+        assert_eq!(
+            app.hub_states.get("acme/large"),
+            Some(&HubModelState::Loading)
+        );
+    }
+
+    #[test]
+    fn context_key_changes_vram_and_tab_keys_have_no_effect() {
+        let mut app = app();
+        let id = app.selected_model().unwrap().id.clone();
+        app.local_metadata
+            .insert(id, decoder_metadata(Some(32_768)));
+        let before = app
+            .context_estimate(app.selected_model().unwrap())
+            .allocation_input_bytes
+            .unwrap();
+
+        let selected = app.selected;
+        let context = app.context_tokens;
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 5)
+                .is_none()
+        );
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), 5)
+                .is_none()
+        );
+        assert_eq!(app.selected, selected);
+        assert_eq!(app.context_tokens, context);
+
+        app.handle_key(press('c'), 5);
+        assert_eq!(app.context_tokens, 4_096);
+        let after = app
+            .context_estimate(app.selected_model().unwrap())
+            .allocation_input_bytes
+            .unwrap();
+        assert!(after > before);
+    }
+
+    #[test]
+    fn model_max_context_is_deduplicated_and_caps_estimates() {
+        let mut app = app();
+        let id = app.selected_model().unwrap().id.clone();
+        app.local_metadata.insert(id, decoder_metadata(Some(3_000)));
+        app.handle_key(press('c'), 5);
+        assert_eq!(app.context_tokens, 3_000);
+        app.context_tokens = 8_192;
+        let estimate = app.context_estimate(app.selected_model().unwrap());
+        assert_eq!(estimate.effective_tokens, 3_000);
+        assert!(estimate.capped_to_model_max);
     }
 
     #[test]
@@ -784,6 +1132,21 @@ mod tests {
             app.handle_key(press('y'), 1);
             terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
         }
+    }
+
+    #[test]
+    fn one_cell_delete_confirmation_still_shows_emphasized_y() {
+        let mut app = app();
+        app.handle_key(press('d'), 1);
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+
+        terminal.draw(|frame| ui::draw(frame, &app)).unwrap();
+
+        let cell = &terminal.backend().buffer().content()[0];
+        assert_eq!(cell.symbol(), "Y");
+        assert_eq!(cell.fg, ratatui::style::Color::Yellow);
+        assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+        assert!(cell.modifier.contains(ratatui::style::Modifier::UNDERLINED));
     }
 
     #[test]

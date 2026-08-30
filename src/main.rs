@@ -1,6 +1,7 @@
 mod app;
 mod cache;
 mod gpu;
+mod hub;
 mod ui;
 
 use std::{
@@ -31,6 +32,10 @@ struct Cli {
     /// Hugging Face cache directory to inspect instead of the default cache.
     #[arg(long, value_name = "PATH")]
     cache_dir: Option<PathBuf>,
+
+    /// Enrich local cache entries from the Hugging Face Hub.
+    #[arg(long)]
+    online: bool,
 }
 
 fn main() -> Result<()> {
@@ -38,7 +43,7 @@ fn main() -> Result<()> {
     install_panic_hook();
 
     let mut terminal = init_terminal().context("failed to initialize terminal")?;
-    let app_result = app::run(&mut terminal, cli.cache_dir);
+    let app_result = app::run(&mut terminal, cli.cache_dir, cli.online);
     let restore_result = restore_terminal(&mut terminal);
 
     match (app_result, restore_result) {
@@ -119,4 +124,15 @@ fn install_panic_hook() {
         restore_terminal_best_effort();
         previous_hook(panic_info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn online_is_explicitly_opt_in() {
+        assert!(!Cli::try_parse_from(["hugtop"]).unwrap().online);
+        assert!(Cli::try_parse_from(["hugtop", "--online"]).unwrap().online);
+    }
 }

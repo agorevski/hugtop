@@ -10,9 +10,14 @@ use ratatui::{
 };
 
 use crate::{
-    app::{ActionStatus, App, PendingDelete, VRAM_OVERHEAD_PERCENT},
-    cache::ModelInfo,
+    app::{ActionStatus, App, HubModelState, PendingDelete, VRAM_OVERHEAD_PERCENT},
+    cache::{
+        CacheCompleteness, CacheWarning, CompatibilityStatus, EstimateConfidence,
+        LocalModelMetadata, MetadataSource, ModelDtype, ModelInfo, ParameterCountConfidence,
+        QuantizationSource, WeightFormat,
+    },
     gpu::{GpuAllocationEstimate, GpuCountEstimate, GpuDetection, GpuDeviceAllocation},
+    hub::{self, GatedStatus, RevisionStatus},
 };
 
 const CYAN: Color = Color::Rgb(66, 211, 255);
@@ -34,7 +39,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &App) {
         draw_dashboard(frame, area, app);
     }
     if app.show_help {
-        draw_help(frame, area);
+        draw_help(frame, area, app);
     }
     if let Some(pending) = app.pending_delete.as_ref() {
         draw_delete_confirmation(frame, area, pending);
@@ -54,10 +59,10 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &App) {
     draw_header(frame, rows[0], app);
     draw_summary(frame, rows[1], app);
 
-    let body = if area.width >= 96 {
-        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(rows[2])
+    let body = if area.width >= 110 {
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(rows[2])
     } else {
-        Layout::vertical([Constraint::Percentage(57), Constraint::Percentage(43)]).split(rows[2])
+        Layout::vertical([Constraint::Percentage(38), Constraint::Percentage(62)]).split(rows[2])
     };
     draw_models(frame, body[0], app);
     draw_detail(frame, body[1], app);
@@ -65,6 +70,12 @@ fn draw_dashboard(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let online = if app.online {
+        let (done, total) = app.hub_progress();
+        format!(" · HUB {done}/{total}")
+    } else {
+        " · OFFLINE".into()
+    };
     let title = Line::from(vec![
         Span::styled(
             "  ◈ ",
@@ -74,7 +85,10 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             "hugtop",
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" // MODEL CACHE", Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" // MODEL CACHE{online}"),
+            Style::default().fg(Color::White),
+        ),
     ]);
     let filter = if app.editing_filter {
         format!(" FILTER › {}█ ", app.filter_draft)
@@ -162,9 +176,10 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let wide = area.width >= 92;
     let rows = app.visible.iter().map(|index| {
         let model = &app.models[*index];
-        Row::new(vec![
+        let mut cells = vec![
             Cell::from(model.id.clone()),
             Cell::from(format_bytes(model.size_bytes)),
             Cell::from(
@@ -173,30 +188,54 @@ fn draw_models(frame: &mut Frame, area: Rect, app: &App) {
                     .unwrap_or_else(|| "unknown".into()),
             ),
             Cell::from(gpu_count_label(app, model)),
-        ])
+        ];
+        if wide {
+            cells.push(Cell::from(compact_model_kind(app.metadata_for(model))));
+        }
+        Row::new(cells)
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(18),
-            Constraint::Length(11),
-            Constraint::Length(11),
-            Constraint::Length(12),
-        ],
-    )
-    .header(
-        Row::new(["REPOSITORY", "CACHE SIZE", "EST. VRAM", "GPUS NEEDED"])
-            .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
-            .bottom_margin(1),
-    )
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::Rgb(30, 75, 96))
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("▌ ")
-    .block(panel().title(title));
+    let (constraints, headings) = if wide {
+        (
+            vec![
+                Constraint::Min(18),
+                Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Length(12),
+                Constraint::Length(18),
+            ],
+            vec![
+                "REPOSITORY",
+                "CACHE SIZE",
+                "EST. VRAM",
+                "GPUS NEEDED",
+                "KIND",
+            ],
+        )
+    } else {
+        (
+            vec![
+                Constraint::Min(18),
+                Constraint::Length(11),
+                Constraint::Length(11),
+                Constraint::Length(12),
+            ],
+            vec!["REPOSITORY", "CACHE SIZE", "EST. VRAM", "GPUS NEEDED"],
+        )
+    };
+    let table = Table::new(rows, constraints)
+        .header(
+            Row::new(headings)
+                .style(Style::default().fg(MUTED).add_modifier(Modifier::BOLD))
+                .bottom_margin(1),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(30, 75, 96))
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▌ ")
+        .block(panel().title(title));
     let mut state = TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -213,7 +252,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    frame.render_widget(panel().title(" INSPECTOR "), area);
+    frame.render_widget(panel().title(" SELECTED MODEL "), area);
     let inner = area.inner(Margin::new(1, 1));
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -221,14 +260,33 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
 
     let allocation = app.gpu_allocation_estimate(model);
     if inner.height <= 4 {
+        let metadata = app.metadata_for(model);
+        let compatibility = metadata.map(|value| value.runtime_compatibility(&app.gpu_detection));
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled(
-                    &model.name,
+                    truncate_text(&model.id, inner.width as usize),
                     Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
                 ),
+                detail_line(
+                    "Health ",
+                    app.metadata_for(model)
+                        .map(|value| completeness_label(value.completeness).to_owned())
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+                detail_line(
+                    "Runtime ",
+                    format!(
+                        "{} · {} context",
+                        compatibility
+                            .as_ref()
+                            .map(|value| compatibility_label(value.status))
+                            .unwrap_or("unknown"),
+                        format_tokens(app.context_tokens)
+                    ),
+                ),
                 Line::styled(
-                    compact_vram_summary(allocation.as_ref()),
+                    format!("GPU {}", compact_vram_summary(allocation.as_ref())),
                     vram_status(app, allocation.as_ref()).1,
                 ),
             ]),
@@ -253,57 +311,568 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(inner);
 
-    let mut details = vec![
+    if rows[0].width >= 76 && rows[0].height >= 12 {
+        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(rows[0]);
+        frame.render_widget(
+            Paragraph::new(identity_health_lines(app, model))
+                .block(panel().title(" IDENTITY & HEALTH "))
+                .wrap(Wrap { trim: false }),
+            columns[0],
+        );
+        frame.render_widget(
+            Paragraph::new(revision_runtime_lines(app, model))
+                .block(panel().title(" REVISION & RUNTIME "))
+                .wrap(Wrap { trim: false }),
+            columns[1],
+        );
+    } else {
+        let mut lines = identity_health_lines(app, model);
+        lines.push(Line::raw(""));
+        lines.extend(revision_runtime_lines(app, model));
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
+    }
+    draw_vram_plan(frame, rows[1], app, allocation.as_ref());
+}
+
+fn identity_health_lines(app: &App, model: &ModelInfo) -> Vec<Line<'static>> {
+    let metadata = app.metadata_for(model);
+    let architecture = metadata
+        .and_then(|value| value.identity.architectures.first())
+        .map(String::as_str)
+        .or_else(|| metadata.and_then(|value| value.identity.model_type.as_deref()))
+        .unwrap_or("unknown");
+    let family = metadata
+        .and_then(|value| value.identity.family.as_deref())
+        .unwrap_or("unknown");
+    let task = metadata
+        .and_then(|value| value.pipeline_task.as_deref())
+        .unwrap_or("unknown");
+    let completeness = metadata
+        .map(|value| completeness_label(value.completeness))
+        .unwrap_or("unknown");
+    let dtype = metadata
+        .and_then(|value| value.precision.dtype.as_ref())
+        .map(dtype_label)
+        .unwrap_or("unknown");
+    let quantization = metadata
+        .and_then(|value| value.precision.quantization.as_ref())
+        .map(quantization_label)
+        .unwrap_or_else(|| "none detected".into());
+    let formats = metadata
+        .map(|value| {
+            if value.weight_formats.is_empty() {
+                "none recognized".into()
+            } else {
+                value
+                    .weight_formats
+                    .iter()
+                    .map(weight_format_label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let license = metadata
+        .and_then(|value| value.license.as_deref())
+        .unwrap_or("unknown");
+    let mut lines = vec![
         Line::styled(
-            &model.name,
+            truncate_text(&model.id, 120),
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
+        detail_line("Architecture   ", truncate_text(architecture, 80)),
+        detail_line("Family         ", truncate_text(family, 80)),
+        detail_line("Task           ", truncate_text(task, 80)),
+        detail_line("Parameters     ", parameter_label(metadata)),
+        detail_line("Dtype          ", dtype.to_owned()),
+        detail_line("Quantization   ", truncate_text(&quantization, 100)),
+        detail_line("Formats        ", formats),
+        detail_line("License        ", truncate_text(license, 80)),
+        detail_line("Completeness   ", completeness.to_owned()),
+        detail_line(
+            "Snapshots/refs ",
+            format!("{}/{}", model.snapshot_count, model.revision_count),
+        ),
+    ];
+    let mut warnings = metadata
+        .map(|value| value.warnings.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    warnings.sort_by_key(|warning| warning_priority(warning));
+    if metadata.is_some_and(|value| value.requires_remote_code) {
+        lines.push(Line::styled(
+            "⚠ remote custom code referenced",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if warnings.is_empty() {
+        lines.push(detail_line("Warnings       ", "none".into()));
+    } else {
+        lines.push(detail_line(
+            "Warnings       ",
+            format!("{} total", warnings.len()),
+        ));
+        for warning in warnings.into_iter().take(3) {
+            lines.push(Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                Span::raw(cache_warning_label(warning)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn revision_runtime_lines(app: &App, model: &ModelInfo) -> Vec<Line<'static>> {
+    let metadata = app.metadata_for(model);
+    let estimate = app.context_estimate(model);
+    let compatibility = metadata.map(|value| value.runtime_compatibility(&app.gpu_detection));
+    let mut lines = vec![
+        detail_line("Local revision ", local_revision(metadata)),
+        hub_summary_line(app, model),
+        hub_revision_line(app, model),
+        hub_freshness_line(app, model),
+        hub_model_line(app, model),
         Line::from(vec![
-            Span::styled("Cache on disk ", Style::default().fg(MUTED)),
-            Span::raw(format_bytes(model.size_bytes)),
-        ]),
-        Line::from(vec![
-            Span::styled("Model weights ", Style::default().fg(MUTED)),
-            Span::raw(
-                model
-                    .estimated_model_weight_bytes
-                    .map(format_bytes)
-                    .unwrap_or_else(|| "unknown (no usable weight artifacts)".into()),
+            Span::styled("Compatibility ", Style::default().fg(MUTED)),
+            Span::styled(
+                compatibility
+                    .as_ref()
+                    .map(|value| compatibility_label(value.status))
+                    .unwrap_or("unknown"),
+                compatibility_style(
+                    compatibility
+                        .as_ref()
+                        .map(|value| value.status)
+                        .unwrap_or(CompatibilityStatus::Unknown),
+                ),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("Runtime VRAM  ", Style::default().fg(MUTED)),
-            Span::raw(vram_requirement_label(app, model)),
-        ]),
     ];
-    if rows[0].height >= 5 {
-        details.push(Line::from(vec![
-            Span::styled("Organization  ", Style::default().fg(MUTED)),
-            Span::raw(&model.organization),
-        ]));
+    if let Some(compatibility) = &compatibility {
+        let mut issues = compatibility.issues.iter().collect::<Vec<_>>();
+        issues.sort_by_key(|issue| compatibility_priority(issue.status));
+        let shown = issues.len().min(2);
+        for issue in issues.into_iter().take(shown) {
+            lines.push(Line::from(vec![
+                Span::styled("• ", compatibility_style(issue.status)),
+                Span::raw(truncate_text(&issue.reason, 100)),
+            ]));
+        }
+        if compatibility.issues.len() > shown {
+            lines.push(detail_line(
+                "Reasons        ",
+                format!(
+                    "{} total; highest severity shown",
+                    compatibility.issues.len()
+                ),
+            ));
+        }
     }
-    if rows[0].height >= 6 {
-        details.push(Line::from(vec![
-            Span::styled("Snapshots     ", Style::default().fg(MUTED)),
-            Span::raw(model.snapshot_count.to_string()),
-            Span::styled("   Refs  ", Style::default().fg(MUTED)),
-            Span::raw(model.revision_count.to_string()),
-        ]));
+    lines.extend([
+        detail_line(
+            "Context        ",
+            format!(
+                "{} selected / {} effective{} / {} max",
+                format_tokens(estimate.requested_tokens),
+                format_tokens(estimate.effective_tokens),
+                if estimate.capped_to_model_max {
+                    " (capped)"
+                } else {
+                    ""
+                },
+                metadata
+                    .and_then(|value| value.maximum_context_length)
+                    .map(format_tokens)
+                    .unwrap_or_else(|| "unknown".into())
+            ),
+        ),
+        detail_line(
+            "Weights        ",
+            model
+                .estimated_model_weight_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        detail_line(
+            "Runtime allow. ",
+            estimate
+                .base_allocation_bytes
+                .zip(model.estimated_model_weight_bytes)
+                .map(|(base, weights)| {
+                    format!(
+                        "{} ({VRAM_OVERHEAD_PERCENT}%)",
+                        format_bytes(base.saturating_sub(weights))
+                    )
+                })
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        detail_line(
+            "KV estimate    ",
+            estimate
+                .kv_cache_bytes
+                .map(|bytes| {
+                    format!(
+                        "{} ({})",
+                        format_bytes(bytes),
+                        confidence_label(estimate.confidence)
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "unavailable: {}",
+                        estimate.reason.as_deref().unwrap_or("unknown reason")
+                    )
+                }),
+        ),
+        detail_line(
+            "Total VRAM     ",
+            estimate
+                .allocation_input_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        detail_line("GPU inventory ", gpu_inventory_label(&app.gpu_detection)),
+    ]);
+    lines
+}
+
+fn compatibility_priority(value: CompatibilityStatus) -> u8 {
+    match value {
+        CompatibilityStatus::Unsupported => 0,
+        CompatibilityStatus::Warning => 1,
+        CompatibilityStatus::Unknown => 2,
+        CompatibilityStatus::LikelyCompatible => 3,
+        CompatibilityStatus::Compatible => 4,
     }
-    if rows[0].height >= 7 {
-        details.push(Line::from(vec![
-            Span::styled("Detected GPUs ", Style::default().fg(MUTED)),
-            Span::raw(gpu_inventory_label(&app.gpu_detection)),
-        ]));
+}
+
+fn quantization_label(value: &crate::cache::QuantizationInfo) -> String {
+    format!(
+        "{}{}{} ({})",
+        truncate_text(&value.method, 40),
+        value
+            .bits
+            .map(|bits| format!(" {bits}-bit"))
+            .unwrap_or_default(),
+        value
+            .variant
+            .as_deref()
+            .map(|variant| format!(" {variant}"))
+            .unwrap_or_default(),
+        match value.source {
+            QuantizationSource::Config => "config",
+            QuantizationSource::FileName => "filename",
+        }
+    )
+}
+
+fn warning_priority(value: &CacheWarning) -> u8 {
+    match value {
+        CacheWarning::MissingReferencedFile(_)
+        | CacheWarning::IncompleteArtifact(_)
+        | CacheWarning::IncompleteShardSet { .. } => 0,
+        CacheWarning::LockArtifact(_)
+        | CacheWarning::MalformedMetadata(_)
+        | CacheWarning::OversizedMetadata(_) => 1,
+        CacheWarning::MultipleSnapshots(_) | CacheWarning::DuplicateRevisionReferences { .. } => 2,
     }
-    if rows[0].height >= 8 {
-        details.push(Line::from(vec![
-            Span::styled("Location      ", Style::default().fg(MUTED)),
-            Span::raw(model.path.display().to_string()),
-        ]));
+}
+
+fn hub_summary_line(app: &App, model: &ModelInfo) -> Line<'static> {
+    if !app.online {
+        return detail_line("Hub status     ", "offline (network disabled)".into());
     }
-    frame.render_widget(Paragraph::new(details).wrap(Wrap { trim: false }), rows[0]);
-    draw_vram_plan(frame, rows[1], app, allocation.as_ref());
+    match app.hub_states.get(&model.id) {
+        Some(HubModelState::Loading) => {
+            detail_line("Hub status     ", "loading in background".into())
+        }
+        Some(HubModelState::Error(error)) => detail_line(
+            "Hub status     ",
+            format!("error: {}", truncate_text(error, 80)),
+        ),
+        Some(HubModelState::Ready(metadata)) => detail_line(
+            "Hub status     ",
+            format!(
+                "online · {}{}{}{}",
+                gated_label(&metadata.gated),
+                if metadata.private { " · private" } else { "" },
+                if metadata.disabled {
+                    " · disabled"
+                } else {
+                    ""
+                },
+                if metadata.deprecated {
+                    " · deprecated"
+                } else {
+                    ""
+                }
+            ),
+        ),
+        None => detail_line("Hub status     ", "not queued".into()),
+    }
+}
+
+fn hub_revision_line(app: &App, model: &ModelInfo) -> Line<'static> {
+    let revision = match app.hub_states.get(&model.id) {
+        Some(HubModelState::Ready(metadata)) => metadata
+            .latest_revision
+            .as_deref()
+            .map(|value| truncate_text(value, 64))
+            .unwrap_or_else(|| "unknown".into()),
+        _ => "unknown".into(),
+    };
+    detail_line("Hub revision   ", revision)
+}
+
+fn hub_freshness_line(app: &App, model: &ModelInfo) -> Line<'static> {
+    let Some(HubModelState::Ready(metadata)) = app.hub_states.get(&model.id) else {
+        return detail_line("Freshness      ", "unknown".into());
+    };
+    let local = app
+        .metadata_for(model)
+        .and_then(|value| value.selected_revision.as_ref())
+        .map(|value| value.commit.as_str());
+    let freshness = revision_label(hub::compare_revision(
+        local,
+        metadata.latest_revision.as_deref(),
+    ));
+    let modified = metadata.last_modified.as_deref().unwrap_or("time unknown");
+    detail_line(
+        "Freshness      ",
+        format!("{freshness} · {}", truncate_text(modified, 50)),
+    )
+}
+
+fn hub_model_line(app: &App, model: &ModelInfo) -> Line<'static> {
+    let Some(HubModelState::Ready(metadata)) = app.hub_states.get(&model.id) else {
+        return detail_line("Hub task/lib   ", "unknown".into());
+    };
+    detail_line(
+        "Hub task/lib   ",
+        format!(
+            "{} / {}",
+            metadata.pipeline_tag.as_deref().unwrap_or("unknown"),
+            metadata.library.as_deref().unwrap_or("unknown")
+        ),
+    )
+}
+
+fn detail_line<'a>(label: &'static str, value: String) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(label, Style::default().fg(MUTED)),
+        Span::raw(value),
+    ])
+}
+
+fn compact_model_kind(metadata: Option<&LocalModelMetadata>) -> String {
+    let Some(metadata) = metadata else {
+        return "unknown".into();
+    };
+    let value = metadata
+        .identity
+        .family
+        .as_deref()
+        .or(metadata.pipeline_task.as_deref())
+        .unwrap_or("unknown");
+    let suffix = if metadata.completeness == CacheCompleteness::Partial {
+        " ⚠"
+    } else if metadata.requires_remote_code || !metadata.warnings.is_empty() {
+        " !"
+    } else {
+        ""
+    };
+    format!("{}{}", truncate_text(value, 14), suffix)
+}
+
+fn parameter_label(metadata: Option<&LocalModelMetadata>) -> String {
+    let Some(parameters) = metadata.and_then(|value| value.parameters.as_ref()) else {
+        return "unknown".into();
+    };
+    let confidence = match parameters.confidence {
+        ParameterCountConfidence::Exact => "exact",
+        ParameterCountConfidence::Reported => "reported",
+    };
+    let source = match &parameters.source {
+        MetadataSource::SafeTensorsHeader => "safetensors header".into(),
+        MetadataSource::SafeTensorsMetadata => "safetensors metadata".into(),
+        MetadataSource::ConfigField(field) => format!("config {}", truncate_text(field, 30)),
+        MetadataSource::ModelCard => "model card".into(),
+    };
+    format!(
+        "{} ({confidence}, {source})",
+        format_count(parameters.value)
+    )
+}
+
+fn format_count(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        format!("{:.2}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn local_revision(metadata: Option<&LocalModelMetadata>) -> String {
+    metadata
+        .and_then(|value| value.selected_revision.as_ref())
+        .map(|value| {
+            let refs = if value.references.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    value
+                        .references
+                        .iter()
+                        .take(3)
+                        .map(|value| truncate_text(value, 24))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            format!("{}{}", truncate_text(&value.commit, 64), refs)
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn completeness_label(value: CacheCompleteness) -> &'static str {
+    match value {
+        CacheCompleteness::Complete => "complete",
+        CacheCompleteness::Partial => "partial / incomplete",
+        CacheCompleteness::Unknown => "unknown",
+    }
+}
+
+fn confidence_label(value: EstimateConfidence) -> &'static str {
+    match value {
+        EstimateConfidence::Exact => "exact dimensions",
+        EstimateConfidence::Estimated => "estimated dimensions",
+        EstimateConfidence::Unavailable => "unavailable",
+    }
+}
+
+fn compatibility_label(value: CompatibilityStatus) -> &'static str {
+    match value {
+        CompatibilityStatus::Compatible => "compatible",
+        CompatibilityStatus::LikelyCompatible => "likely compatible",
+        CompatibilityStatus::Warning => "warning",
+        CompatibilityStatus::Unsupported => "unsupported",
+        CompatibilityStatus::Unknown => "unknown",
+    }
+}
+
+fn compatibility_style(value: CompatibilityStatus) -> Style {
+    match value {
+        CompatibilityStatus::Compatible | CompatibilityStatus::LikelyCompatible => {
+            Style::default().fg(GREEN).add_modifier(Modifier::BOLD)
+        }
+        CompatibilityStatus::Warning => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        CompatibilityStatus::Unsupported => Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD),
+        CompatibilityStatus::Unknown => Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+    }
+}
+
+fn dtype_label(value: &ModelDtype) -> &'static str {
+    match value {
+        ModelDtype::Float64 => "float64",
+        ModelDtype::Float32 => "float32",
+        ModelDtype::Float16 => "float16",
+        ModelDtype::BFloat16 => "bfloat16",
+        ModelDtype::Float8 => "float8",
+        ModelDtype::Int8 => "int8",
+        ModelDtype::Int4 => "int4",
+        ModelDtype::Other(_) => "other",
+    }
+}
+
+fn weight_format_label(value: &WeightFormat) -> &'static str {
+    match value {
+        WeightFormat::SafeTensors => "safetensors",
+        WeightFormat::PyTorch => "pytorch",
+        WeightFormat::Gguf => "GGUF",
+        WeightFormat::Onnx => "ONNX",
+        WeightFormat::TensorFlow => "TensorFlow",
+        WeightFormat::Flax => "Flax",
+    }
+}
+
+fn cache_warning_label(value: &CacheWarning) -> String {
+    match value {
+        CacheWarning::MissingReferencedFile(path) => {
+            format!("missing {}", truncate_text(&path.display().to_string(), 40))
+        }
+        CacheWarning::IncompleteArtifact(path) => format!(
+            "incomplete {}",
+            truncate_text(&path.display().to_string(), 40)
+        ),
+        CacheWarning::LockArtifact(path) => {
+            format!("lock {}", truncate_text(&path.display().to_string(), 40))
+        }
+        CacheWarning::MalformedMetadata(path) => format!(
+            "malformed metadata {}",
+            truncate_text(&path.display().to_string(), 40)
+        ),
+        CacheWarning::OversizedMetadata(path) => format!(
+            "oversized metadata {}",
+            truncate_text(&path.display().to_string(), 40)
+        ),
+        CacheWarning::IncompleteShardSet {
+            group,
+            expected,
+            found,
+        } => format!(
+            "missing shards in {} ({found}/{expected})",
+            truncate_text(group, 30)
+        ),
+        CacheWarning::MultipleSnapshots(count) => {
+            format!("{count} snapshots; selected newest/referenced")
+        }
+        CacheWarning::DuplicateRevisionReferences { commit, references } => format!(
+            "duplicate refs {} → {}",
+            references
+                .iter()
+                .take(3)
+                .map(|value| truncate_text(value, 20))
+                .collect::<Vec<_>>()
+                .join(","),
+            truncate_text(commit, 20)
+        ),
+    }
+}
+
+fn revision_label(value: RevisionStatus) -> &'static str {
+    match value {
+        RevisionStatus::UpToDate => "up to date",
+        RevisionStatus::Outdated => "outdated",
+        RevisionStatus::Unknown => "unknown",
+    }
+}
+
+fn gated_label(value: &GatedStatus) -> String {
+    match value {
+        GatedStatus::No => "public".into(),
+        GatedStatus::Yes => "gated".into(),
+        GatedStatus::Manual => "manually gated".into(),
+        GatedStatus::Other(value) => format!("gated ({})", truncate_text(value, 30)),
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens.is_multiple_of(1024) {
+        format!("{}K", tokens / 1024)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn draw_vram_plan(
@@ -360,7 +929,7 @@ fn draw_vram_plan(
             Style::default().fg(GREEN)
         };
         frame.render_widget(
-            Paragraph::new(gpu_bar_row(device, inner.width as usize)).style(style),
+            Paragraph::new(gpu_bar_row(device, inner.width as usize, free_bytes)).style(style),
             Rect::new(
                 inner.x,
                 inner.y.saturating_add(1 + row as u16),
@@ -394,17 +963,6 @@ fn selected_gpu_free_bytes(app: &App, device_index: usize) -> Option<u64> {
             .map(|gpu| gpu.free_mib.saturating_mul(1 << 20)),
         _ => None,
     }
-}
-
-fn vram_requirement_label(app: &App, model: &ModelInfo) -> String {
-    app.estimated_vram_mib(model)
-        .map(|mib| {
-            format!(
-                "{} (weights + current {VRAM_OVERHEAD_PERCENT}% allowance; activations/KV vary)",
-                format_mib(mib)
-            )
-        })
-        .unwrap_or_else(|| "unknown; cache disk size is not a weight estimate".into())
 }
 
 fn vram_status(app: &App, allocation: Option<&GpuAllocationEstimate>) -> (String, Style) {
@@ -520,14 +1078,18 @@ fn compact_vram_summary(allocation: Option<&GpuAllocationEstimate>) -> String {
     }
 }
 
-fn gpu_bar_row(device: &GpuDeviceAllocation, width: usize) -> String {
+fn gpu_bar_row(device: &GpuDeviceAllocation, width: usize, free_bytes: Option<u64>) -> String {
     let numbers = allocation_numbers(device.allocated_bytes, device.capacity_bytes);
     let percentage = if device.capacity_bytes == 0 {
         0
     } else {
         ((u128::from(device.allocated_bytes) * 100) / u128::from(device.capacity_bytes)) as u64
     };
-    let suffix = format!("{numbers} {percentage}%");
+    let free_warning = free_bytes
+        .filter(|free| *free < device.allocated_bytes)
+        .map(|free| format!(" ⚠ free {}", format_bytes(free)))
+        .unwrap_or_default();
+    let suffix = format!("{numbers} {percentage}%{free_warning}");
     let base_prefix = format!("GPU {}", device.device_index);
     let mut prefix = base_prefix.clone();
     if width >= 40 {
@@ -598,9 +1160,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
+        let network = if app.online {
+            let (done, total) = app.hub_progress();
+            format!("Hub {done}/{total}")
+        } else {
+            "offline".into()
+        };
         Line::styled(
             format!(
-                " {} · {} visible ",
+                " {} · {} visible · {network} ",
                 app.cache_root.display(),
                 format_bytes(app.visible_bytes())
             ),
@@ -618,6 +1186,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw(" reverse  "),
         key("r"),
         Span::raw(" refresh  "),
+        key("c"),
+        Span::raw(" context  "),
         Span::styled(
             "d",
             Style::default()
@@ -655,9 +1225,10 @@ fn draw_compact(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(
                 format!(
-                    "{} · {}",
+                    "{} · {} · {}",
                     app.visible.len(),
-                    format_bytes(app.visible_bytes())
+                    format_bytes(app.visible_bytes()),
+                    if app.online { "online" } else { "offline" }
                 ),
                 Style::default().fg(MUTED),
             ),
@@ -666,25 +1237,56 @@ fn draw_compact(frame: &mut Frame, area: Rect, app: &App) {
     );
     let items = app.visible.iter().enumerate().map(|(position, index)| {
         let model = &app.models[*index];
-        let detail = if position == app.selected {
+        if position == app.selected {
             let allocation = app.gpu_allocation_estimate(model);
-            compact_vram_summary(allocation.as_ref())
+            let metadata = app.metadata_for(model);
+            let compatibility =
+                metadata.map(|value| value.runtime_compatibility(&app.gpu_detection));
+            ListItem::new(vec![
+                Line::styled(
+                    model.id.clone(),
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+                ),
+                Line::from(vec![
+                    Span::styled("Runtime ", Style::default().fg(MUTED)),
+                    Span::raw(format!(
+                        "{} · {} ctx",
+                        compatibility
+                            .as_ref()
+                            .map(|value| compatibility_label(value.status))
+                            .unwrap_or("unknown"),
+                        format_tokens(app.context_tokens)
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled("GPU ", Style::default().fg(MUTED)),
+                    Span::raw(compact_vram_summary(allocation.as_ref())),
+                ]),
+                Line::from(vec![
+                    Span::styled("Health ", Style::default().fg(MUTED)),
+                    Span::raw(
+                        metadata
+                            .map(|value| completeness_label(value.completeness).to_owned())
+                            .unwrap_or_else(|| "unknown".into()),
+                    ),
+                ]),
+            ])
         } else {
-            format!(
-                "VRAM {} · GPUs {}",
-                app.estimated_vram_mib(model)
-                    .map(format_mib)
-                    .unwrap_or_else(|| "unknown".into()),
-                gpu_count_label(app, model)
-            )
-        };
-        ListItem::new(Line::from(vec![
-            Span::raw(&model.id),
-            Span::styled(
-                format!("  disk {} · {}", format_bytes(model.size_bytes), detail),
-                Style::default().fg(PURPLE),
-            ),
-        ]))
+            ListItem::new(Line::from(vec![
+                Span::raw(&model.id),
+                Span::styled(
+                    format!(
+                        "  disk {} · VRAM {} · GPUs {}",
+                        format_bytes(model.size_bytes),
+                        app.estimated_vram_mib(model)
+                            .map(format_mib)
+                            .unwrap_or_else(|| "unknown".into()),
+                        gpu_count_label(app, model)
+                    ),
+                    Style::default().fg(PURPLE),
+                ),
+            ]))
+        }
     });
     let list = List::new(items)
         .block(panel())
@@ -700,7 +1302,10 @@ fn draw_compact(frame: &mut Frame, area: Rect, app: &App) {
     } else if let Some(error) = &app.scan_error {
         format!("⚠ {error}")
     } else {
-        "↑↓ move  / filter  d delete  ? help  q quit".into()
+        format!(
+            "↑↓ move  c context {}  d delete  ? help  q quit",
+            format_tokens(app.context_tokens)
+        )
     };
     let prompt_color = match app.action_status.as_ref() {
         Some(ActionStatus::Success(_)) => GREEN,
@@ -716,7 +1321,7 @@ fn draw_compact(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::styled(
             "NAVIGATION",
@@ -735,10 +1340,19 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::raw("  S                  Reverse sort direction"),
         Line::raw("  Esc                Clear active filter"),
         Line::raw("  r                  Rescan the cache"),
+        Line::raw("  c                  Cycle 2K/4K/8K/16K/32K/model-max context"),
         Line::raw("  d                  Delete selected model (asks first)"),
         Line::raw("  ?                  Toggle this help"),
         Line::raw("  q / Ctrl-C         Quit"),
         Line::raw(""),
+        Line::styled(
+            if app.online {
+                "ONLINE: Hub metadata loads on one bounded background worker"
+            } else {
+                "OFFLINE: no Hub requests; restart with --online to opt in"
+            },
+            Style::default().fg(MUTED),
+        ),
         Line::styled("Press Esc, q, or ? to close", Style::default().fg(GREEN)),
     ];
     let popup = popup_rect(area, 66, (lines.len() as u16).saturating_add(2));
@@ -757,6 +1371,20 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 }
 
 fn draw_delete_confirmation(frame: &mut Frame, area: Rect, pending: &PendingDelete) {
+    let confirm_style = Style::default()
+        .fg(Color::Yellow)
+        .bg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    if area.width < 8 || area.height < 2 {
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("Y", confirm_style)))
+                .alignment(Alignment::Center)
+                .style(Style::default().bg(Color::Rgb(12, 17, 25))),
+            area,
+        );
+        return;
+    }
     let prompt = vec![
         Line::from(vec![
             Span::styled(
@@ -765,13 +1393,7 @@ fn draw_delete_confirmation(frame: &mut Frame, area: Rect, pending: &PendingDele
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "Y",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            ),
+            Span::styled("Y", confirm_style),
             Span::styled(
                 " to permanently delete",
                 Style::default()
@@ -957,8 +1579,18 @@ fn gpu_inventory_label(detection: &GpuDetection) -> String {
                     sum.1.saturating_add(gpu.free_mib),
                 )
             });
+            let capabilities = inventory
+                .gpus()
+                .iter()
+                .map(|gpu| {
+                    gpu.compute_capability
+                        .map(|capability| format!("{}.{}", capability.major, capability.minor))
+                        .unwrap_or_else(|| "?".into())
+                })
+                .collect::<Vec<_>>()
+                .join("/");
             format!(
-                "{} · {} total · {} free",
+                "{} · {} total · {} free · compute {capabilities}",
                 inventory.len(),
                 format_mib(total),
                 format_mib(free)
@@ -1023,6 +1655,48 @@ mod tests {
         let mut app = App::new("cache".into(), detection);
         app.models = vec![model(weight_bytes)];
         app.visible = vec![0];
+        app.local_metadata.insert(
+            "acme/model".into(),
+            LocalModelMetadata {
+                identity: crate::cache::ModelIdentity {
+                    architectures: vec!["LlamaForCausalLM".into()],
+                    model_type: Some("llama".into()),
+                    family: Some("Llama".into()),
+                },
+                precision: crate::cache::PrecisionInfo {
+                    dtype: Some(ModelDtype::Float16),
+                    quantization: Some(crate::cache::QuantizationInfo {
+                        method: "GPTQ".into(),
+                        bits: Some(4),
+                        variant: Some("grouped".into()),
+                        source: QuantizationSource::Config,
+                    }),
+                },
+                parameters: Some(crate::cache::ParameterCount {
+                    value: 7_000_000_000,
+                    confidence: ParameterCountConfidence::Exact,
+                    source: MetadataSource::SafeTensorsHeader,
+                }),
+                maximum_context_length: Some(32_768),
+                pipeline_task: Some("text-generation".into()),
+                license: Some("apache-2.0".into()),
+                transformer: crate::cache::TransformerDimensions {
+                    hidden_size: Some(4096),
+                    num_hidden_layers: Some(32),
+                    num_attention_heads: Some(32),
+                    num_key_value_heads: Some(8),
+                    head_dim: Some(128),
+                    dtype_bytes: Some(2),
+                },
+                completeness: CacheCompleteness::Complete,
+                weight_formats: vec![WeightFormat::SafeTensors],
+                selected_revision: Some(crate::cache::SelectedRevision {
+                    commit: "aaaaaaaa".into(),
+                    references: vec!["main".into()],
+                }),
+                ..LocalModelMetadata::default()
+            },
+        );
         app
     }
 
@@ -1056,7 +1730,7 @@ mod tests {
         );
         assert_eq!(
             gpu_inventory_label(&detected),
-            "2 · 24 MiB total · 16 MiB free"
+            "2 · 24 MiB total · 16 MiB free · compute ?/?"
         );
     }
 
@@ -1074,7 +1748,7 @@ mod tests {
         assert!(
             vram_status(&zero, zero_plan.as_ref())
                 .0
-                .contains("zero-byte")
+                .contains("no NVIDIA GPUs detected")
         );
 
         let unavailable = app_with(
@@ -1146,10 +1820,10 @@ mod tests {
             panic!("expected a two-GPU allocation");
         };
         assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].allocated_bytes, 30 * GIB);
-        assert_eq!(devices[1].allocated_bytes, 30 * GIB);
-        assert!(gpu_bar_row(&devices[0], 60).contains("30/50 GiB 60%"));
-        assert!(gpu_bar_row(&devices[1], 60).contains("30/50 GiB 60%"));
+        assert_eq!(devices[0].allocated_bytes, devices[1].allocated_bytes);
+        assert!(devices[0].allocated_bytes > 30 * GIB);
+        assert!(gpu_bar_row(&devices[0], 60, None).contains("GPU 0"));
+        assert!(gpu_bar_row(&devices[1], 60, None).contains("GPU 1"));
     }
 
     #[test]
@@ -1160,7 +1834,7 @@ mod tests {
             capacity_bytes: 50 * GIB,
             allocated_bytes: 30 * GIB,
         };
-        let row = gpu_bar_row(&device, 30);
+        let row = gpu_bar_row(&device, 30, None);
         assert!(row.contains("GPU 7"));
         assert!(row.contains('█'));
         assert!(row.contains("30/50 GiB 60%"));
@@ -1210,5 +1884,132 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw(frame, &app)).unwrap();
         }
+    }
+
+    #[test]
+    fn wide_frame_shows_metadata_health_runtime_hub_and_gpu_bars_together() {
+        let mut app = app_with(
+            Some(50 * GIB),
+            detected("GPU A, 51200, 20000, 8.0\nGPU B, 51200, 51200, 8.0"),
+        );
+        app.online = true;
+        app.local_metadata.get_mut("acme/model").unwrap().warnings = vec![
+            CacheWarning::MultipleSnapshots(2),
+            CacheWarning::IncompleteShardSet {
+                group: "model.safetensors".into(),
+                expected: 4,
+                found: 3,
+            },
+        ];
+        app.hub_states.insert(
+            "acme/model".into(),
+            HubModelState::Ready(crate::hub::ModelMetadata {
+                repo_id: "acme/model".into(),
+                latest_revision: Some("bbbbbbbb".into()),
+                last_modified: Some("2026-08-30T12:00:00Z".into()),
+                pipeline_tag: Some("text-generation".into()),
+                library: Some("transformers".into()),
+                tags: vec![],
+                license: Some("apache-2.0".into()),
+                gated: GatedStatus::No,
+                private: false,
+                disabled: false,
+                deprecated: false,
+            }),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(180, 48)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        for expected in [
+            "Architecture",
+            "LlamaForCausalLM",
+            "Parameters",
+            "7.00B",
+            "Dtype",
+            "float16",
+            "Quantization",
+            "GPTQ 4-bit",
+            "Formats",
+            "apache-2.0",
+            "Completeness",
+            "Warnings",
+            "missing shards",
+            "Local revision",
+            "Hub revision",
+            "Freshness",
+            "Hub task/lib",
+            "transformers",
+            "Compatibility",
+            "Context",
+            "Runtime allow.",
+            "KV estimate",
+            "Total VRAM",
+            "GPU 0",
+            "GPU 1",
+            "Needs 2 GPUs",
+            "free 20 GiB",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}\n{text}");
+        }
+        assert!(text.contains("outdated"));
+        assert!(text.contains("warning"));
+        assert!(text.contains('█'));
+        assert!(!text.contains("[Overview]"));
+        assert!(!text.contains("Shift-Tab"));
+    }
+
+    #[test]
+    fn stacked_frame_retains_all_information_categories_and_gpu_rows() {
+        let mut app = app_with(
+            Some(50 * GIB),
+            detected("GPU A, 51200, 51200\nGPU B, 51200, 51200"),
+        );
+        app.online = true;
+        app.hub_states
+            .insert("acme/model".into(), HubModelState::Loading);
+        let mut terminal = Terminal::new(TestBackend::new(100, 72)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        for expected in [
+            "Architecture",
+            "Completeness",
+            "Hub status",
+            "loading in background",
+            "Compatibility",
+            "Context",
+            "KV estimate",
+            "GPU 0",
+            "GPU 1",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}\n{text}");
+        }
+    }
+
+    #[test]
+    fn compact_frame_has_explicit_runtime_gpu_and_health_summaries_without_tabs() {
+        let app = app_with(
+            Some(50 * GIB),
+            detected("GPU A, 51200, 51200\nGPU B, 51200, 51200"),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(44, 13)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("acme/model"));
+        assert!(text.contains("Runtime"));
+        assert!(text.contains("GPU"));
+        assert!(text.contains("Health"));
+        assert!(!text.contains("Tab"));
+        assert!(!text.contains("Overview"));
+    }
+
+    #[test]
+    fn absent_metadata_renders_safe_unified_fallbacks() {
+        let mut app = app_with(Some(GIB), GpuDetection::NoGpu);
+        app.local_metadata.clear();
+        let mut terminal = Terminal::new(TestBackend::new(100, 48)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("unknown"));
+        assert!(text.contains("VRAM PLAN"));
     }
 }

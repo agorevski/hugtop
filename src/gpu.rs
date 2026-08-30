@@ -2,8 +2,7 @@
 //!
 //! Discovery uses `nvidia-smi` and does not require a driver library. VRAM
 //! requirements passed to the estimation helpers are assumed to already
-//! include framework/runtime overhead. [`add_overhead_percent`] is provided
-//! when callers want an explicit conservative allowance.
+//! include framework/runtime overhead.
 
 use std::{
     io,
@@ -17,6 +16,20 @@ pub struct Gpu {
     pub name: String,
     pub total_mib: u64,
     pub free_mib: u64,
+    pub compute_capability: Option<ComputeCapability>,
+}
+
+/// NVIDIA CUDA compute capability, when reported by `nvidia-smi`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ComputeCapability {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl ComputeCapability {
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
 }
 
 /// A non-empty collection of detected GPUs.
@@ -82,8 +95,7 @@ impl GpuInventory {
     /// would exceed its capacity. Integer-byte remainders use detection order.
     ///
     /// This method does not apply runtime overhead. Callers that need an
-    /// allowance must apply it exactly once before converting to bytes, for
-    /// example with [`add_overhead_percent`].
+    /// allowance must apply it exactly once before calling this method.
     pub fn allocate(&self, required_bytes: u64) -> GpuAllocationEstimate {
         if required_bytes == 0 {
             return GpuAllocationEstimate::NotRequired;
@@ -230,6 +242,19 @@ pub struct GpuParseError {
 
 /// Detect NVIDIA GPUs installed on the local machine.
 pub fn detect_nvidia_gpus() -> GpuDetection {
+    let extended = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total,memory.free,compute_cap",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    if extended
+        .as_ref()
+        .is_ok_and(|output| output.status.success())
+    {
+        return classify_command_result(extended);
+    }
+
     classify_command_result(
         Command::new("nvidia-smi")
             .args([
@@ -260,10 +285,10 @@ pub fn parse_nvidia_smi_output(output: &str) -> Result<Option<GpuInventory>, Gpu
             line: line_number,
             message,
         })?;
-        if fields.len() != 3 {
+        if fields.len() != 3 && fields.len() != 4 {
             return Err(GpuParseError {
                 line: line_number,
-                message: format!("expected 3 CSV fields, found {}", fields.len()),
+                message: format!("expected 3 or 4 CSV fields, found {}", fields.len()),
             });
         }
 
@@ -288,10 +313,16 @@ pub fn parse_nvidia_smi_output(output: &str) -> Result<Option<GpuInventory>, Gpu
                 message: "free memory exceeds total memory".to_owned(),
             });
         }
+        let compute_capability = fields
+            .get(3)
+            .map(|field| parse_compute_capability(field, line_number))
+            .transpose()?
+            .flatten();
         gpus.push(Gpu {
             name,
             total_mib,
             free_mib,
+            compute_capability,
         });
     }
 
@@ -300,16 +331,6 @@ pub fn parse_nvidia_smi_output(output: &str) -> Result<Option<GpuInventory>, Gpu
     } else {
         Ok(Some(GpuInventory { gpus }))
     }
-}
-
-/// Add a percentage allowance, rounded up to the next MiB.
-///
-/// Returns `None` if the adjusted requirement cannot be represented as `u64`.
-pub fn add_overhead_percent(required_mib: u64, percent: u32) -> Option<u64> {
-    let multiplier = 100_u128.checked_add(u128::from(percent))?;
-    let numerator = u128::from(required_mib).checked_mul(multiplier)?;
-    let adjusted = numerator.checked_add(99)? / 100;
-    u64::try_from(adjusted).ok()
 }
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -456,6 +477,32 @@ fn parse_mib(value: &str, line: usize, label: &str) -> Result<u64, GpuParseError
     })
 }
 
+fn parse_compute_capability(
+    value: &str,
+    line: usize,
+) -> Result<Option<ComputeCapability>, GpuParseError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("n/a")
+        || value.eq_ignore_ascii_case("[not supported]")
+    {
+        return Ok(None);
+    }
+    let (major, minor) = value.split_once('.').ok_or_else(|| GpuParseError {
+        line,
+        message: "compute capability is not in major.minor form".to_owned(),
+    })?;
+    let major = major.parse().map_err(|_| GpuParseError {
+        line,
+        message: "compute capability major version is invalid".to_owned(),
+    })?;
+    let minor = minor.parse().map_err(|_| GpuParseError {
+        line,
+        message: "compute capability minor version is invalid".to_owned(),
+    })?;
+    Ok(Some(ComputeCapability { major, minor }))
+}
+
 fn parse_csv_line(line: &str) -> Result<Vec<String>, String> {
     let mut fields = Vec::new();
     let mut field = String::new();
@@ -523,10 +570,31 @@ mod tests {
                 name: "NVIDIA RTX 4090".to_owned(),
                 total_mib: 24564,
                 free_mib: 22000,
+                compute_capability: None,
             }
         );
         assert_eq!(inventory.gpus()[1].name, "NVIDIA A100, PCIe");
         assert_eq!(inventory.gpus()[1].total_mib, 40960);
+    }
+
+    #[test]
+    fn parses_optional_compute_capability_and_old_output() {
+        let inventory = parse_nvidia_smi_output("new, 100, 90, 8.9\nold, 200, 100, N/A")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            inventory.gpus()[0].compute_capability,
+            Some(ComputeCapability::new(8, 9))
+        );
+        assert_eq!(inventory.gpus()[1].compute_capability, None);
+        assert_eq!(
+            parse_nvidia_smi_output("legacy, 100, 90")
+                .unwrap()
+                .unwrap()
+                .gpus()[0]
+                .compute_capability,
+            None
+        );
     }
 
     #[test]
@@ -587,12 +655,6 @@ mod tests {
         assert!(parse_nvidia_smi_output("gpu, 100, 101").is_err());
         assert!(parse_nvidia_smi_output("\"gpu, 100, 50").is_err());
         assert!(parse_nvidia_smi_output("gpu, 100").is_err());
-    }
-
-    #[test]
-    fn applies_rounded_overhead() {
-        assert_eq!(add_overhead_percent(101, 10), Some(112));
-        assert_eq!(add_overhead_percent(u64::MAX, u32::MAX), None);
     }
 
     #[test]
