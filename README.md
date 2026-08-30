@@ -4,19 +4,7 @@
 downloaded to your local cache. It presents model storage, metadata, and cache
 locations in a responsive, btop-inspired interface built with Ratatui.
 
-```text
-+ hugtop --------------------------------------- models: 18 -- cache: 42.7 GiB -+
-| Models                              | Details                                |
-|-------------------------------------+----------------------------------------|
-| > meta-llama/Llama-3.2-3B-Instruct  | Repository: meta-llama/Llama-3.2...   |
-|   Qwen/Qwen2.5-Coder-7B-Instruct    | Revisions:  2                         |
-|   sentence-transformers/all-MiniLM  | Size:       6.4 GiB                   |
-|   openai/whisper-small              | Modified:   2026-08-28                |
-|                                     | Path:       ~/.cache/huggingface/...   |
-+-------------------------------------+----------------------------------------+
-| Filter: llama          Sort: size desc          [r] refresh  [?] help [q] quit |
-+------------------------------------------------------------------------------+
-```
+![hugtop model cache dashboard](docs/assets/screen.png)
 
 ## Features
 
