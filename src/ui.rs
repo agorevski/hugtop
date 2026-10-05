@@ -272,7 +272,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
                 ),
                 detail_line(
                     "Health ",
-                    app.metadata_for(model)
+                    metadata
                         .map(|value| completeness_label(value.completeness).to_owned())
                         .unwrap_or_else(|| "unknown".into()),
                 ),
