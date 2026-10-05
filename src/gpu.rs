@@ -57,9 +57,7 @@ impl GpuInventory {
             return GpuCountEstimate::NotRequired;
         }
 
-        let mut capacities: Vec<u64> = self.gpus.iter().map(|gpu| gpu.total_mib).collect();
-        capacities.sort_unstable_by(|left, right| right.cmp(left));
-
+        let capacities: Vec<u64> = self.gpus.iter().map(|gpu| gpu.total_mib).collect();
         let available_mib = capacities
             .iter()
             .fold(0_u64, |total, capacity| total.saturating_add(*capacity));
@@ -70,20 +68,10 @@ impl GpuInventory {
             };
         }
 
-        let mut accumulated_mib = 0_u64;
-        for (index, capacity) in capacities.into_iter().enumerate() {
-            accumulated_mib = accumulated_mib.saturating_add(capacity);
-            if accumulated_mib >= required_mib
-                && let Some(count) = NonZeroUsize::new(index + 1)
-            {
-                return GpuCountEstimate::Gpus(count);
-            }
-        }
-
-        GpuCountEstimate::InsufficientCapacity {
-            required_mib,
-            available_mib,
-        }
+        let count = minimum_device_count(&capacities, required_mib);
+        GpuCountEstimate::Gpus(
+            NonZeroUsize::new(count).expect("a positive requirement that fits uses at least one GPU"),
+        )
     }
 
     /// Allocate an already-overhead-adjusted byte requirement across GPUs.
@@ -335,13 +323,16 @@ pub fn parse_nvidia_smi_output(output: &str) -> Result<Option<GpuInventory>, Gpu
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
-fn minimum_device_count(capacities: &[u64], required_bytes: u64) -> usize {
+/// Smallest number of devices (largest-first) whose combined capacity in the
+/// caller's unit reaches `required`. Falls back to the full count when the
+/// capacities cannot satisfy `required`.
+fn minimum_device_count(capacities: &[u64], required: u64) -> usize {
     let mut descending = capacities.to_vec();
     descending.sort_unstable_by(|left, right| right.cmp(left));
     let mut total = 0_u64;
     for (index, capacity) in descending.into_iter().enumerate() {
         total = total.saturating_add(capacity);
-        if total >= required_bytes {
+        if total >= required {
             return index + 1;
         }
     }
