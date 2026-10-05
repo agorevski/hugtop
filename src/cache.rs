@@ -1526,33 +1526,41 @@ fn quantization_from_config(config: &Value) -> Option<QuantizationInfo> {
     })
 }
 
+/// Reads a regular file resolved under `model_root`, bounded by `limit`.
+///
+/// Pushes `OversizedMetadata` and returns `None` when the file exceeds `limit`
+/// or cannot be read within it.
+fn read_bounded_file(
+    path: &Path,
+    model_root: &Path,
+    limit: u64,
+    warnings: &mut Vec<CacheWarning>,
+) -> Option<Vec<u8>> {
+    let resolved = resolve_local_file(path, model_root)?;
+    let metadata = fs::metadata(&resolved).ok()?;
+    if metadata.len() > limit {
+        warnings.push(CacheWarning::OversizedMetadata(path.to_path_buf()));
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read_result = fs::File::open(resolved)
+        .ok()?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes);
+    if read_result.is_err() || bytes.len() as u64 > limit {
+        warnings.push(CacheWarning::OversizedMetadata(path.to_path_buf()));
+        return None;
+    }
+    Some(bytes)
+}
+
 fn read_json(
     path: &Path,
     model_root: &Path,
     limit: u64,
     warnings: &mut Vec<CacheWarning>,
 ) -> Option<Value> {
-    let resolved = resolve_local_file(path, model_root)?;
-    let metadata = fs::metadata(&resolved).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    if metadata.len() > limit {
-        warnings.push(CacheWarning::OversizedMetadata(path.to_path_buf()));
-        return None;
-    }
-    let mut file = fs::File::open(resolved).ok()?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if file
-        .by_ref()
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .is_err()
-        || bytes.len() as u64 > limit
-    {
-        warnings.push(CacheWarning::OversizedMetadata(path.to_path_buf()));
-        return None;
-    }
+    let bytes = read_bounded_file(path, model_root, limit, warnings)?;
     match serde_json::from_slice(&bytes) {
         Ok(value) => Some(value),
         Err(_) => {
@@ -1567,22 +1575,7 @@ fn read_model_card_front_matter(
     model_root: &Path,
     warnings: &mut Vec<CacheWarning>,
 ) -> Option<HashMap<String, String>> {
-    let resolved = resolve_local_file(path, model_root)?;
-    let metadata = fs::metadata(&resolved).ok()?;
-    if metadata.len() > MAX_MODEL_CARD_BYTES {
-        warnings.push(CacheWarning::OversizedMetadata(path.to_path_buf()));
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    fs::File::open(resolved)
-        .ok()?
-        .take(MAX_MODEL_CARD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_MODEL_CARD_BYTES {
-        warnings.push(CacheWarning::OversizedMetadata(path.to_path_buf()));
-        return None;
-    }
+    let bytes = read_bounded_file(path, model_root, MAX_MODEL_CARD_BYTES, warnings)?;
     let text = match std::str::from_utf8(&bytes) {
         Ok(text) => text,
         Err(_) => {
