@@ -1760,27 +1760,33 @@ fn inspect_snapshot_artifacts(
     result
 }
 
-fn detect_weight_format(file_name: &str) -> Option<WeightFormat> {
+/// Recognized weight-file extensions and the format each one denotes.
+const WEIGHT_EXTENSIONS: &[(&str, WeightFormat)] = &[
+    (".safetensors", WeightFormat::SafeTensors),
+    (".gguf", WeightFormat::Gguf),
+    (".bin", WeightFormat::PyTorch),
+    (".pth", WeightFormat::PyTorch),
+    (".pt", WeightFormat::PyTorch),
+    (".onnx", WeightFormat::Onnx),
+    (".h5", WeightFormat::TensorFlow),
+    (".ckpt", WeightFormat::TensorFlow),
+    (".msgpack", WeightFormat::Flax),
+];
+
+/// Match a lowercased file name to its weight format and the extension that
+/// matched, rejecting training artifacts such as optimizer and scheduler state.
+fn weight_format(file_name: &str) -> Option<(&'static str, WeightFormat)> {
     if is_non_model_artifact(file_name) {
-        None
-    } else if file_name.ends_with(".safetensors") {
-        Some(WeightFormat::SafeTensors)
-    } else if file_name.ends_with(".gguf") {
-        Some(WeightFormat::Gguf)
-    } else if file_name.ends_with(".bin")
-        || file_name.ends_with(".pt")
-        || file_name.ends_with(".pth")
-    {
-        Some(WeightFormat::PyTorch)
-    } else if file_name.ends_with(".onnx") {
-        Some(WeightFormat::Onnx)
-    } else if file_name.ends_with(".h5") || file_name.ends_with(".ckpt") {
-        Some(WeightFormat::TensorFlow)
-    } else if file_name.ends_with(".msgpack") {
-        Some(WeightFormat::Flax)
-    } else {
-        None
+        return None;
     }
+    WEIGHT_EXTENSIONS
+        .iter()
+        .copied()
+        .find(|(extension, _)| file_name.ends_with(extension))
+}
+
+fn detect_weight_format(file_name: &str) -> Option<WeightFormat> {
+    weight_format(file_name).map(|(_, format)| format)
 }
 
 fn inspect_index_manifest(
@@ -1912,20 +1918,8 @@ fn quantization_from_gguf_name(file_name: &str) -> Option<QuantizationInfo> {
 
 fn weight_artifact(file_name: &str) -> Option<WeightArtifact> {
     let lower = file_name.to_ascii_lowercase();
-    if is_non_model_artifact(&lower) {
-        return None;
-    }
-    let (stem, format) = if let Some(stem) = lower.strip_suffix(".safetensors") {
-        (stem, WeightFormat::SafeTensors)
-    } else if let Some(stem) = lower.strip_suffix(".gguf") {
-        (stem, WeightFormat::Gguf)
-    } else if let Some(stem) = lower.strip_suffix(".bin") {
-        (stem, WeightFormat::PyTorch)
-    } else if let Some(stem) = lower.strip_suffix(".pth") {
-        (stem, WeightFormat::PyTorch)
-    } else {
-        (lower.strip_suffix(".pt")?, WeightFormat::PyTorch)
-    };
+    let (extension, format) = weight_format(&lower)?;
+    let stem = lower.strip_suffix(extension)?;
     let (group, shard) = shard_group(stem);
     Some((format, group.to_owned(), shard))
 }
@@ -2287,6 +2281,39 @@ mod tests {
 
         let models = scan_models(&root.0).unwrap();
         assert_eq!(models[0].estimated_model_weight_bytes, Some(15));
+    }
+
+    #[test]
+    fn estimates_bytes_for_every_recognized_weight_format() {
+        let root = TestDir::new("all-formats");
+        let snapshot = root.0.join("models--org--model/snapshots/revision");
+        fs::create_dir_all(&snapshot).unwrap();
+        for (file_name, bytes) in [
+            ("model.safetensors", 11),
+            ("model.bin", 12),
+            ("model.gguf", 13),
+            ("model.onnx", 14),
+            ("model.h5", 15),
+            ("model.msgpack", 16),
+        ] {
+            write_bytes(&snapshot.join(file_name), &vec![0; bytes]);
+        }
+
+        let model = &scan_models(&root.0).unwrap()[0];
+        // Every recognized format is both listed and sized, so a model cannot
+        // be reported as e.g. Onnx while also claiming it has no weight size.
+        assert_eq!(
+            model.local_metadata().weight_formats,
+            [
+                WeightFormat::SafeTensors,
+                WeightFormat::PyTorch,
+                WeightFormat::Gguf,
+                WeightFormat::Onnx,
+                WeightFormat::TensorFlow,
+                WeightFormat::Flax,
+            ]
+        );
+        assert_eq!(model.estimated_model_weight_bytes, Some(16));
     }
 
     #[test]
