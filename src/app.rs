@@ -25,6 +25,7 @@ use crate::{
 const EVENT_WAIT: Duration = Duration::from_millis(250);
 pub(crate) const VRAM_OVERHEAD_PERCENT: u32 = 20;
 const DEFAULT_CONTEXT_TOKENS: u64 = 2_048;
+const BYTES_PER_MIB: u64 = 1 << 20;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HubModelState {
@@ -281,7 +282,9 @@ impl App {
 
     pub(crate) fn estimated_vram_mib(&self, model: &ModelInfo) -> Option<u64> {
         let bytes = self.context_estimate(model).allocation_input_bytes?;
-        bytes.checked_add((1 << 20) - 1).map(|value| value >> 20)
+        bytes
+            .checked_add(BYTES_PER_MIB - 1)
+            .map(|value| value / BYTES_PER_MIB)
     }
 
     pub(crate) fn gpu_allocation_estimate(
