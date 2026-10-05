@@ -271,8 +271,9 @@ impl App {
     }
 
     pub(crate) fn context_estimate(&self, model: &ModelInfo) -> ContextVramEstimate {
+        let fallback = LocalModelMetadata::default();
         model.context_vram_estimate(
-            &self.metadata_for(model).cloned().unwrap_or_default(),
+            self.metadata_for(model).unwrap_or(&fallback),
             self.context_tokens,
             VRAM_OVERHEAD_PERCENT,
         )
