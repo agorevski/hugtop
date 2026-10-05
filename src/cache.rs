@@ -22,6 +22,8 @@ const MODEL_PREFIX: &str = "models--";
 const MAX_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_MODEL_CARD_BYTES: u64 = 512 * 1024;
 const MAX_WEIGHT_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+/// Upper bound on a `refs` file, which holds a single commit hash.
+const MAX_REFERENCE_BYTES: u64 = 4096;
 #[cfg(test)]
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
@@ -1101,8 +1103,8 @@ fn referenced_snapshots(model_root: &Path, snapshots_root: &Path) -> Vec<PathBuf
                 pending.extend(entries.flatten().map(|entry| entry.path()));
             }
         } else if metadata.file_type().is_file()
-            && metadata.len() <= 4096
-            && let Some(contents) = read_small_text(&path, 4096)
+            && metadata.len() <= MAX_REFERENCE_BYTES
+            && let Some(contents) = read_small_text(&path, MAX_REFERENCE_BYTES)
         {
             let revision = contents.trim();
             if safe_snapshot_name(revision) {
@@ -1326,10 +1328,10 @@ fn revision_references(model_root: &Path) -> HashMap<String, Vec<String>> {
             }
             continue;
         }
-        if !metadata.is_file() || metadata.len() > 4096 {
+        if !metadata.is_file() || metadata.len() > MAX_REFERENCE_BYTES {
             continue;
         }
-        let Some(value) = read_small_text(&path, 4096) else {
+        let Some(value) = read_small_text(&path, MAX_REFERENCE_BYTES) else {
             continue;
         };
         let commit = value.trim();
