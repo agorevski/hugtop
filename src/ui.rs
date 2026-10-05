@@ -20,6 +20,8 @@ use crate::{
     hub::{self, GatedStatus, RevisionStatus},
 };
 
+const BYTES_PER_MIB: u64 = 1 << 20;
+
 const CYAN: Color = Color::Rgb(66, 211, 255);
 const PURPLE: Color = Color::Rgb(183, 120, 255);
 const GREEN: Color = Color::Rgb(94, 234, 165);
@@ -960,7 +962,7 @@ fn selected_gpu_free_bytes(app: &App, device_index: usize) -> Option<u64> {
         GpuDetection::Detected(inventory) => inventory
             .gpus()
             .get(device_index)
-            .map(|gpu| gpu.free_mib.saturating_mul(1 << 20)),
+            .map(|gpu| gpu.free_mib.saturating_mul(BYTES_PER_MIB)),
         _ => None,
     }
 }
@@ -1555,7 +1557,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn format_mib(mib: u64) -> String {
-    format_bytes(mib.saturating_mul(1 << 20))
+    format_bytes(mib.saturating_mul(BYTES_PER_MIB))
 }
 
 fn gpu_count_label(app: &App, model: &ModelInfo) -> String {
