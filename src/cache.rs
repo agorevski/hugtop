@@ -883,31 +883,34 @@ struct TreeStats {
     last_modified: Option<SystemTime>,
 }
 
-fn collect_tree_stats(root: &Path) -> TreeStats {
-    let mut stats = TreeStats::default();
+/// Depth-first walk of `root`, calling `visit` for every entry (root included).
+///
+/// Real directories are descended into; symlinks are surfaced to `visit` but
+/// never descended into, so the walk cannot loop or escape through links.
+fn walk_tree(root: &Path, mut visit: impl FnMut(&Path, &fs::Metadata)) {
     let mut pending = vec![root.to_path_buf()];
-
     while let Some(path) = pending.pop() {
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        update_modified(&mut stats.last_modified, metadata.modified().ok());
-
-        let file_type = metadata.file_type();
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_file() {
-            stats.size_bytes = stats.size_bytes.saturating_add(metadata.len());
-            continue;
-        }
-        if file_type.is_dir() {
-            let Ok(entries) = fs::read_dir(path) else {
-                continue;
-            };
+        let is_dir = metadata.is_dir();
+        visit(&path, &metadata);
+        if is_dir
+            && let Ok(entries) = fs::read_dir(&path)
+        {
             pending.extend(entries.flatten().map(|entry| entry.path()));
         }
     }
+}
+
+fn collect_tree_stats(root: &Path) -> TreeStats {
+    let mut stats = TreeStats::default();
+    walk_tree(root, |_, metadata| {
+        update_modified(&mut stats.last_modified, metadata.modified().ok());
+        if metadata.is_file() {
+            stats.size_bytes = stats.size_bytes.saturating_add(metadata.len());
+        }
+    });
     stats
 }
 
@@ -932,19 +935,11 @@ fn count_immediate_directories(path: &Path) -> usize {
 
 fn count_regular_files(root: &Path) -> usize {
     let mut count = 0;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(path) = pending.pop() {
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata.file_type().is_file() {
+    walk_tree(root, |_, metadata| {
+        if metadata.is_file() {
             count += 1;
-        } else if metadata.file_type().is_dir()
-            && let Ok(entries) = fs::read_dir(path)
-        {
-            pending.extend(entries.flatten().map(|entry| entry.path()));
         }
-    }
+    });
     count
 }
 
@@ -1093,18 +1088,10 @@ fn select_snapshot(model_root: &Path) -> Option<PathBuf> {
 
 fn referenced_snapshots(model_root: &Path, snapshots_root: &Path) -> Vec<PathBuf> {
     let mut referenced = Vec::new();
-    let mut pending = vec![model_root.join("refs")];
-    while let Some(path) = pending.pop() {
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if metadata.file_type().is_dir() {
-            if let Ok(entries) = fs::read_dir(path) {
-                pending.extend(entries.flatten().map(|entry| entry.path()));
-            }
-        } else if metadata.file_type().is_file()
+    walk_tree(&model_root.join("refs"), |path, metadata| {
+        if metadata.is_file()
             && metadata.len() <= MAX_REFERENCE_BYTES
-            && let Some(contents) = read_small_text(&path, MAX_REFERENCE_BYTES)
+            && let Some(contents) = read_small_text(path, MAX_REFERENCE_BYTES)
         {
             let revision = contents.trim();
             if safe_snapshot_name(revision) {
@@ -1114,7 +1101,7 @@ fn referenced_snapshots(model_root: &Path, snapshots_root: &Path) -> Vec<PathBuf
                 }
             }
         }
-    }
+    });
     referenced
 }
 
